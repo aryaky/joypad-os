@@ -602,6 +602,15 @@ void usbd_init(void)
 #endif
     // Load saved mode from flash (runtime_settings holds the canonical state)
     flash_t* settings = flash_get_settings();
+#ifdef USBD_FORCE_DEFAULT_MODE
+    // Let the compile-time USBD_DEFAULT_MODE win over the mode persisted in
+    // flash. Needed where the board's button cannot cycle into modes that
+    // usbd_get_next_mode() skips (Xbox One), and where the settings sector is
+    // not touched by UF2 flashing (it sits at the end of flash).
+    settings = NULL;
+    printf("[usbd] USBD_FORCE_DEFAULT_MODE set - ignoring saved mode, using %s\n",
+           mode_names[output_mode]);
+#endif
     if (settings) {
         printf("[usbd] Flash load success! usb_output_mode=%d, active_profile=%d\n",
                settings->usb_output_mode, settings->active_profile_index);

@@ -1582,6 +1582,8 @@ target_compile_definitions(joypad_usb_rp2350usba PRIVATE
     WS2812_PIN=16
     USE_BOOTSEL_BUTTON=1
     APP_NAME="usb2usb"
+    USBD_DEFAULT_MODE=USB_OUTPUT_MODE_XBONE
+    USBD_FORCE_DEFAULT_MODE=1
 )
 target_sources(joypad_usb_rp2350usba PUBLIC ${COMMON_SOURCES} ${USB_DEVICE_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2usb/app.c
