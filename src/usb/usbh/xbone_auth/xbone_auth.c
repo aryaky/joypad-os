@@ -223,7 +223,10 @@ bool xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
         printf("[xbone_auth] raw passthrough queue full, dropping cmd=0x%02x\n", report[0]);
         return false;
     }
-    printf("[xbone_auth] Raw passthrough to controller: cmd=0x%02x len=%d\n", report[0], len);
+    // 只入队，还没发。措辞必须是 QUEUED：实际发送在 process_report_queue() 里异步
+    // 进行且可能失败（端点忙），说 "to controller" 会让人以为已经到手柄了。
+    printf("[xbone_auth] Raw passthrough QUEUED for controller: cmd=0x%02x len=%d\n",
+           report[0], len);
     memcpy(report_queue[queue_tail].report, report, len);
     report_queue[queue_tail].len = len;
     queue_tail = (queue_tail + 1) % REPORT_QUEUE_SIZE;
@@ -465,6 +468,16 @@ bool xbone_auth_is_complete(void)
     return xbone_auth_is_completed();
 }
 
+// OUT 端点连续忙碌的起点（ms），0 = 当前不忙。
+//
+// 为什么不能只靠 consecutive_send_failures：它一成功就清零，而实测的失败形态是零星
+// 穿插的 —— v39 那轮 15 次发送失败里，计数只到过 1（10 次）和 2（5 次），一次都没
+// 够到下面那条 8 连失败的兜底，abort 全程触发 0 次。按时间窗判定才能覆盖这种形态。
+static uint32_t out_ep_busy_since_ms = 0;
+
+// 端点连续忙多久就认定那笔传输卡住了，去取消它。正常 OUT 传输远快于这个量级。
+#define OUT_EP_BUSY_ABORT_MS 500
+
 static void process_report_queue(void)
 {
     uint32_t now = platform_time_ms();
@@ -499,6 +512,7 @@ static void process_report_queue(void)
 
     if (send_to_dongle(report, len)) {
         consecutive_send_failures = 0;
+        out_ep_busy_since_ms = 0;
         last_report_queue_sent = now;
         if (is_ack) {
             drop_head_ack();
@@ -512,6 +526,20 @@ static void process_report_queue(void)
     consecutive_send_failures++;
     printf("[xbone_auth] Failed to send report to controller (%u in a row)\n",
            consecutive_send_failures);
+
+    // 时间窗兜底：只取消那笔卡住的传输，**不动队列头**。
+    //
+    // 丢队列头才是让手柄反复重放同一个 825 字节窗口的原因，所以这里绝不丢 —— 队头
+    // 留在原地，下一轮照常重试。下面那条 8 连失败的兜底才负责丢弃，且只对非 ACK
+    // 生效。两者职责分开，避免把"取消传输"和"放弃这条报告"混为一谈。
+    if (out_ep_busy_since_ms == 0) {
+        out_ep_busy_since_ms = now;
+    } else if ((now - out_ep_busy_since_ms) >= OUT_EP_BUSY_ABORT_MS) {
+        printf("[xbone_auth] OUT endpoint busy %ums - cancelling stuck transfer (head kept)\n",
+               (unsigned)(now - out_ep_busy_since_ms));
+        tuh_xinput_abort_out(xbone_dev_addr, xbone_instance);
+        out_ep_busy_since_ms = 0;
+    }
 
     // A stuck OUT transfer keeps usbh_edpt_claim() busy forever, and the
     // head of the queue then blocks every other report behind it, which stalls

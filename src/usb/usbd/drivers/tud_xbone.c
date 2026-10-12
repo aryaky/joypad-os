@@ -442,8 +442,13 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
             // otherwise auth succeeds (guide LED solid) but no input ever flows.
             bool fwd = xbone_auth_send_raw_to_controller(p_xbone->epout_buf,
                                                          (uint16_t)xferred_bytes);
+            // fwd 为 true 只代表**入队成功**，不代表已经发到手柄上。真正的发送在
+            // xbone_auth 的队列里异步进行，端点忙时会失败并另打一行。这里写 "sent"
+            // 是在骗人：v39 日志里出现过紧挨着的
+            //   "cmd=0x09 len=13 sent" / "failed to claim endpoint (busy)"
+            // 看上去像发出去了，实际一次都没出去。
             printf("[tud_xbone] Passthrough -> controller: cmd=0x%02x len=%u %s\n",
-                   cmd, (unsigned)xferred_bytes, fwd ? "sent" : "FAILED");
+                   cmd, (unsigned)xferred_bytes, fwd ? "queued" : "DROPPED");
         } else if (cmd == GIP_AUTH || cmd == GIP_FINAL_AUTH) {
             // Check for auth complete marker. These are non-chunked packets, for
             // which the parser never populates the data pointer, so read the raw
