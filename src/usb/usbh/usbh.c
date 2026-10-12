@@ -8,6 +8,8 @@
 #include "intel/intel_wireless_series.h"
 #include "core/services/players/manager.h"
 #include "core/services/codes/codes.h"
+#include "usb/usbh/xbone_auth/xbone_auth.h"
+#include "platform/platform.h"
 #include <stdio.h>
 
 #if defined(CONFIG_MAX3421) && CFG_TUH_MAX3421
@@ -18,6 +20,13 @@ extern uint8_t max3421_get_revision(void);
 #elif defined(CONFIG_USB) && CFG_TUH_RPI_PIO_USB
 #include "pio_usb.h"
 #include "hardware/gpio.h"
+
+// PIO-USB never raises its DISCONNECT interrupt - pio_usb.c sets no such bit -
+// so TinyUSB's tuh_umount_cb is dead code on this port. Poll the root-port line
+// state ourselves instead (SE0 = nothing attached) to notice an unplug.
+extern bool hcd_port_connect_status(uint8_t rhport);
+
+static void usbh_port_watchdog(void);
 #endif
 
 // HID protocol handlers
@@ -209,6 +218,10 @@ void usbh_task(void)
     tuh_task();
 #endif
 
+#if defined(CONFIG_USB) && CFG_TUH_RPI_PIO_USB
+    usbh_port_watchdog();
+#endif
+
 #if CFG_TUH_ENABLED
     intel_wireless_series_task();
 #endif
@@ -235,16 +248,29 @@ void usbh_task(void)
 
 static uint8_t usb_host_device_count = 0;
 
+// Bit (dev_addr - 1) is set while a device is attached at that address. Needed
+// because PIO-USB cannot tell us which address went away, only that the port is
+// now idle - see the unplug watchdog in usbh_task().
+static uint32_t usbh_mounted_addr_mask = 0;
+
+#if defined(CONFIG_USB) && CFG_TUH_RPI_PIO_USB
+// Host lives on rhport 1 when PIO-USB is in use (see usbh_init: tusb_init(1,...)).
+#define USBH_HOST_RHPORT      1
+#define USBH_PORT_CHECK_MS    200
+// Require several consecutive idle reads before believing an unplug: a single
+// misread line state would otherwise tear down a live pad.
+#define USBH_PORT_IDLE_POLLS  3
+static uint32_t usbh_port_check_ms = 0;
+static uint8_t usbh_port_idle_polls = 0;
+#endif
+
 uint8_t usbh_get_device_count(void) { return usb_host_device_count; }
 
-void tuh_mount_cb(uint8_t dev_addr)
+static void usbh_detach_device(uint8_t dev_addr, bool unregister_auth)
 {
-    printf("A device with address %d is mounted\r\n", dev_addr);
-    usb_host_device_count++;
-}
-
-void tuh_umount_cb(uint8_t dev_addr)
-{
+    if (dev_addr >= 1 && dev_addr <= 32) {
+        usbh_mounted_addr_mask &= ~(1u << (dev_addr - 1));
+    }
     printf("A device with address %d is unmounted\r\n", dev_addr);
     if (usb_host_device_count > 0) usb_host_device_count--;
 
@@ -257,7 +283,70 @@ void tuh_umount_cb(uint8_t dev_addr)
 
     // Reset test mode when device disconnects
     codes_reset_test_mode();
+
+    // The Xbox One auth exchange is bound to one controller instance. When we
+    // synthesise the unplug ourselves we must drop it too, or the state machine
+    // keeps waiting on a pad that is gone and the re-plugged one is never
+    // challenged. Real umount callbacks already go through the class driver.
+    if (unregister_auth) {
+        xbone_auth_unregister(dev_addr);
+    }
 }
+
+void tuh_mount_cb(uint8_t dev_addr)
+{
+    // Print the VID/PID too: a pad that enumerates but is not claimed by any
+    // host driver looks identical to "nothing plugged in" without it.
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(dev_addr, &vid, &pid);
+    printf("A device with address %d is mounted (VID=%04x PID=%04x, count=%d)\r\n",
+           dev_addr, vid, pid, usb_host_device_count + 1);
+    usb_host_device_count++;
+    if (dev_addr >= 1 && dev_addr <= 32) {
+        usbh_mounted_addr_mask |= (1u << (dev_addr - 1));
+    }
+}
+
+void tuh_umount_cb(uint8_t dev_addr)
+{
+    usbh_detach_device(dev_addr, false);
+}
+
+#if defined(CONFIG_USB) && CFG_TUH_RPI_PIO_USB
+// Unplug watchdog. PIO-USB never reports removals, so a pad that is pulled out
+// and re-inserted looks like the same device forever: the console has already
+// finished its handshake and never challenges the new instance. Detect the
+// unplug from the root-port line state and tear down ourselves.
+static void usbh_port_watchdog(void)
+{
+    uint32_t now_ms = platform_time_ms();
+    if (now_ms - usbh_port_check_ms < USBH_PORT_CHECK_MS) {
+        return;
+    }
+    usbh_port_check_ms = now_ms;
+
+    if (usbh_mounted_addr_mask == 0 || hcd_port_connect_status(USBH_HOST_RHPORT)) {
+        usbh_port_idle_polls = 0;
+        return;
+    }
+
+    if (++usbh_port_idle_polls < USBH_PORT_IDLE_POLLS) {
+        return;
+    }
+    usbh_port_idle_polls = 0;
+
+    printf("[usbh] Port idle with %u device(s) attached - synthesising unplug\n",
+           usb_host_device_count);
+    while (usbh_mounted_addr_mask != 0) {
+        for (uint8_t i = 0; i < 32; i++) {
+            if (usbh_mounted_addr_mask & (1u << i)) {
+                usbh_detach_device((uint8_t)(i + 1), true);
+                break;
+            }
+        }
+    }
+}
+#endif
 
 //--------------------------------------------------------------------+
 // Input Interface

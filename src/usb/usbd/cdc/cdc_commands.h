@@ -21,6 +21,10 @@ void cdc_commands_task(void);
 // Called by protocol layer when valid CMD packet received
 void cdc_commands_process(const cdc_packet_t* packet);
 
+// Process one command line that arrived on the debug UART. Runs the same
+// command table as the CDC transport and prints the response on the UART.
+void cdc_commands_process_uart_line(const char* line);
+
 // Get protocol context (for sending events)
 cdc_protocol_t* cdc_commands_get_protocol(void);
 

@@ -11,6 +11,8 @@
 #include "core/services/storage/flash.h"
 #include "core/services/leds/neopixel/ws2812.h"
 #include "core/services/profiles/profile.h"
+#include "core/services/storage/gip_map_flash.h"
+#include "gip_button_map.h"
 #include "core/services/players/manager.h"
 #include "core/services/players/feedback.h"
 #include "platform/platform.h"
@@ -248,15 +250,23 @@ static void send_ok(void)
     cdc_protocol_send_response(active_ctx, "{\"ok\":true}");
 }
 
+// Responses also go to the debug UART while a command that arrived on the UART
+// is being answered, so a board wired up with only TX/RX can be used as a
+// console without a USB host. CDC answers are not echoed - the debug log is
+// already on that wire.
+static bool echo_to_uart = false;
+
 static void send_error(const char* msg)
 {
     snprintf(response_buf, sizeof(response_buf),
              "{\"ok\":false,\"error\":\"%s\"}", msg);
+    if (echo_to_uart) printf("%s\n", response_buf);
     cdc_protocol_send_response(active_ctx, response_buf);
 }
 
 static void send_json(const char* json)
 {
+    if (echo_to_uart) printf("%s\n", json);
     cdc_protocol_send_response(active_ctx, json);
 }
 
@@ -4214,6 +4224,85 @@ static void cmd_sd_list(const char* json)
 #endif // CONFIG_SD
 
 // ============================================================================
+// GIPMAP.GET / GIPMAP.SET / GIPMAP.RESET
+// ============================================================================
+//
+// Which physical button a bit of an Xbox One pad's button word stands for is a
+// property of the pad, and reading it wrong used to cost a reflash. These let
+// the layout be read back and rewritten over the wire, and GIPMAP.SET keeps it
+// in flash so it survives power cycles.
+
+static void cmd_gipmap_get(const char* json)
+{
+    (void)json;
+    const uint8_t* map = gip_button_map_current();
+
+    char entries[GIP_BUTTON_MAP_BITS * 5];
+    int pos = 0;
+    for (int i = 0; i < GIP_BUTTON_MAP_BITS; i++) {
+        pos += snprintf(entries + pos, sizeof(entries) - pos, "%s%d",
+                        i ? "," : "", map[i]);
+    }
+
+    uint8_t dflt[GIP_BUTTON_MAP_BITS];
+    gip_button_map_defaults(dflt);
+    bool is_default = (memcmp(map, dflt, GIP_BUTTON_MAP_BITS) == 0);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"map\":[%s],\"default\":%s}",
+             entries, is_default ? "true" : "false");
+    send_json(response_buf);
+}
+
+static void cmd_gipmap_set(const char* json)
+{
+    uint8_t map[GIP_BUTTON_MAP_BITS];
+    int count = json_get_int_array(json, "map", map, GIP_BUTTON_MAP_BITS);
+    if (count != GIP_BUTTON_MAP_BITS) {
+        send_error("expected 16 map entries");
+        return;
+    }
+
+    for (int i = 0; i < GIP_BUTTON_MAP_BITS; i++) {
+        if (map[i] >= GIP_BUTTON_MAP_BITS && map[i] != GIP_BUTTON_MAP_UNUSED) {
+            send_error("map entries must be 0-15, or 255 for an unused bit");
+            return;
+        }
+    }
+
+    if (!gip_button_map_set(map)) {
+        send_error("map rejected - two pad bits claim the same button");
+        return;
+    }
+
+    gip_map_data_t data;
+    memset(&data, 0, sizeof(data));
+    memcpy(data.map, map, GIP_BUTTON_MAP_BITS);
+
+    // The map is already live here. Say so plainly if it could not be stored,
+    // rather than reporting a success that will not survive a power cycle.
+    if (!gip_map_flash_save(&data)) {
+        send_error("map is live but was NOT stored in flash");
+        return;
+    }
+    send_json("{\"ok\":true,\"stored\":true}");
+}
+
+static void cmd_gipmap_reset(const char* json)
+{
+    (void)json;
+    uint8_t dflt[GIP_BUTTON_MAP_BITS];
+    gip_button_map_defaults(dflt);
+    (void)gip_button_map_set(dflt);
+
+    if (!gip_map_flash_erase()) {
+        send_error("reverted to the default map but could not clear flash");
+        return;
+    }
+    send_json("{\"ok\":true,\"default\":true}");
+}
+
+// ============================================================================
 // COMMAND DISPATCH
 // ============================================================================
 
@@ -4363,12 +4452,35 @@ static const cmd_entry_t commands[] = {
     {"PS4AUTH.SET",    cmd_ps4auth_set},
     {"PS4AUTH.STATUS", cmd_ps4auth_status},
     {"PS4AUTH.CLEAR",  cmd_ps4auth_clear},
+    {"GIPMAP.GET",     cmd_gipmap_get},
+    {"GIPMAP.SET",     cmd_gipmap_set},
+    {"GIPMAP.RESET",   cmd_gipmap_reset},
     {NULL, NULL}
 };
 
 // ============================================================================
 // PACKET HANDLER
 // ============================================================================
+
+// Run one command line through the table. Shared by the CDC transport and by
+// the debug UART, so a command cannot work on one and not the other.
+static void dispatch_line(const char* json)
+{
+    char cmd[32];
+    if (!json_get_cmd(json, cmd, sizeof(cmd))) {
+        send_error("invalid command format");
+        return;
+    }
+
+    for (const cmd_entry_t* entry = commands; entry->name; entry++) {
+        if (strcmp(cmd, entry->name) == 0) {
+            entry->handler(json);
+            return;
+        }
+    }
+
+    send_error("unknown command");
+}
 
 static void packet_handler(const cdc_packet_t* packet)
 {
@@ -4382,22 +4494,16 @@ static void packet_handler(const cdc_packet_t* packet)
     memcpy(json, packet->payload, packet->length);
     json[packet->length] = '\0';
 
-    // Extract command name
-    char cmd[32];
-    if (!json_get_cmd(json, cmd, sizeof(cmd))) {
-        send_error("invalid command format");
-        return;
-    }
+    dispatch_line(json);
+}
 
-    // Find and execute handler
-    for (const cmd_entry_t* entry = commands; entry->name; entry++) {
-        if (strcmp(cmd, entry->name) == 0) {
-            entry->handler(json);
-            return;
-        }
-    }
+void cdc_commands_process_uart_line(const char* line)
+{
+    if (!line) return;
 
-    send_error("unknown command");
+    echo_to_uart = true;
+    dispatch_line(line);
+    echo_to_uart = false;
 }
 
 // ============================================================================

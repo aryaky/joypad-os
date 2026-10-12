@@ -9,6 +9,7 @@
 #include "descriptors/xbone_descriptors.h"
 #include "core/buttons.h"
 #include <string.h>
+#include <stdio.h>
 
 // ============================================================================
 // STATE
@@ -56,6 +57,11 @@ static bool xbone_mode_send_report(uint8_t player_index,
 {
     (void)player_index;
     (void)event;
+
+    // What the router thinks was pressed. Printed next to the raw button word
+    // the pad sent (see the PADRX line) so a mapping mistake shows up as a
+    // mismatch between the two instead of as a silent console.
+    printf("[xbone_mode] out buttons=0x%08lx\n", (unsigned long)buttons);
 
     // Clear report
     memset(&xbone_report, 0, sizeof(gip_input_report_t));

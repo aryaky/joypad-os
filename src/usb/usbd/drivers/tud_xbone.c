@@ -7,9 +7,16 @@
 #include <string.h>
 #include <stdio.h>
 #include "../tusb_compat.h"  // usbd_edpt_xfer is_isr shim (0.20.0 vs master)
+#include "../../usbh/xbone_auth/xbone_auth.h"
 
 // Forward declaration for auth passthrough check (weak - returns false if not linked)
 __attribute__((weak)) bool xbone_auth_is_available(void) { return false; }
+
+// Weak stub so the driver still links when the auth module isn't part of the build
+__attribute__((weak)) void xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
+{
+    (void)report; (void)len;
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -62,6 +69,11 @@ static xbone_driver_state_t driver_state = XBONE_STATE_IDLE;
 static bool xbox_powered_on = false;
 static bool waiting_ack = false;
 static uint32_t waiting_ack_timeout = 0;
+
+// How many input reports we have actually put on the wire to the console. The
+// pad-side counter lives in the host driver, so with these two numbers a silent
+// pad, a pad we fail to parse, and a pad we fail to forward stop looking alike.
+static uint32_t input_reports_sent_to_console = 0;
 static uint32_t timer_announce = 0;
 static uint32_t last_report_queue_sent = 0;
 
@@ -79,7 +91,17 @@ static uint8_t queue_count = 0;
 static xbone_auth_t auth_data = { 0 };
 
 // Auth ready marker
-static const uint8_t auth_ready[] = { 0x01, 0x00 };
+// The two auth markers the console actually sends. The old constant was
+// {0x01, 0x00} - that is the payload of xboxone_pdp_auth[], the auth request
+// *we* send the pad, pasted in as if it were the console's reply. The console
+// never sends it: across 23 recorded sessions (45x 01 01, 15x 01 02, never
+// 01 00) the comparison never once matched, so this branch was unreachable.
+// 01 01 follows an accepted response, 01 02 closes the exchange - every
+// session, including the ones the console rejected, so neither one proves the
+// signature was accepted. auth_completed is therefore left alone; only the
+// powered-on flag follows, because the console sends power-on right after.
+#define AUTH_MARKER_RESPONSE_ACCEPTED  0x01
+#define AUTH_MARKER_EXCHANGE_DONE      0x02
 
 // Rolling sequence number for input reports + keep-alive (skips 0 on rollover)
 static uint8_t input_report_sequence = 1;
@@ -284,6 +306,24 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
         }
 
         uint8_t cmd = xgip_get_command(&incoming_xgip);
+        printf("[tud_xbone] Console packet: cmd=0x%02x len=%u", cmd, (unsigned)xferred_bytes);
+        if (cmd == GIP_ACK_RESPONSE) {
+            // Ground truth: the console is a Microsoft GIP implementation, so
+            // how it counts the bytes we send it tells us which accounting to
+            // use when we ACK the controller.
+            uint16_t ack_recv = (uint16_t)(p_xbone->epout_buf[7] | (p_xbone->epout_buf[8] << 8));
+            uint16_t ack_rem = (uint16_t)(p_xbone->epout_buf[11] | (p_xbone->epout_buf[12] << 8));
+            printf(" [console ACK: seq=%u recv=%u rem=%u]", p_xbone->epout_buf[2], ack_recv, ack_rem);
+        } else {
+            // ACKs are far too noisy to dump; everything else is rare enough
+            // that seeing the payload pays for itself (e.g. is this 0x05 a
+            // power-on or a power-off?).
+            printf(" bytes=");
+            for (uint16_t i = 0; i < xferred_bytes && i < 16; i++) {
+                printf("%02x ", p_xbone->epout_buf[i]);
+            }
+        }
+        printf("\n");
 
         if (cmd == GIP_ACK_RESPONSE) {
             waiting_ack = false;
@@ -296,22 +336,58 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
             driver_state = XBONE_STATE_SEND_DESCRIPTOR;
         } else if (cmd == GIP_POWER_MODE_DEVICE_CONFIG || cmd == GIP_CMD_WAKEUP || cmd == GIP_CMD_RUMBLE) {
             xbox_powered_on = true;
+            // The console is telling "us" (the virtual pad) to power on / rumble.
+            // A wired GIP pad only starts emitting 0x20 input reports after it
+            // receives these from its host, so pass them through untouched -
+            // otherwise auth succeeds (guide LED solid) but no input ever flows.
+            xbone_auth_send_raw_to_controller(p_xbone->epout_buf, (uint16_t)xferred_bytes);
         } else if (cmd == GIP_AUTH || cmd == GIP_FINAL_AUTH) {
-            // Check for auth complete marker
-            if (xgip_get_data_length(&incoming_xgip) == 2 &&
-                memcmp(xgip_get_data(&incoming_xgip), auth_ready, sizeof(auth_ready)) == 0) {
-                auth_data.auth_completed = true;
+            // Check for auth complete marker. These are non-chunked packets, for
+            // which the parser never populates the data pointer, so read the raw
+            // bytes: cmd 0x06, length 2, payload 01 01.
+            if (xferred_bytes >= 6 && p_xbone->epout_buf[3] == 0x02 &&
+                p_xbone->epout_buf[4] == 0x01) {
+                if (p_xbone->epout_buf[5] == AUTH_MARKER_EXCHANGE_DONE) {
+                    // The console closed the auth exchange and sends power-on
+                    // next, so stop waiting for an explicit power-mode command.
+                    xbox_powered_on = true;
+                    printf("[tud_xbone] Auth marker 01 02 - console closed the exchange\n");
+                    // xone: the *host* has to close the handshake with a GIP_AUTH
+                    // COMPLETE control packet (06 20 <seq> 02 01 00). The console
+                    // only ever sends 01 01 / 01 02, so nothing ever told the pad
+                    // it was authenticated - send it ourselves on the console's
+                    // behalf, otherwise the pad never emits input reports.
+                    xbone_auth_notify_console_exchange_done();
+                    xbone_auth_send_auth_complete();
+                } else if (p_xbone->epout_buf[5] == AUTH_MARKER_RESPONSE_ACCEPTED) {
+                    printf("[tud_xbone] Auth marker 01 01 - console accepted a response\n");
+                } else {
+                    printf("[tud_xbone] Auth marker 01 %02x from console\n",
+                           p_xbone->epout_buf[5]);
+                }
             }
 
-            // Forward auth to dongle when complete packet received
+            // Reassemble the console's chunked challenge first: relaying the raw
+            // chunks straight to the controller was tried and the console stopped
+            // accepting us, so keep the reassemble-then-rechunk path.
             if (!xgip_is_chunked(&incoming_xgip) ||
                 (xgip_is_chunked(&incoming_xgip) && xgip_end_of_chunk(&incoming_xgip))) {
 
-                xbone_auth_set_data(xgip_get_data(&incoming_xgip),
-                                   xgip_get_data_length(&incoming_xgip),
-                                   xgip_get_sequence(&incoming_xgip),
-                                   xgip_get_command(&incoming_xgip),
-                                   XBONE_AUTH_SEND_CONSOLE_TO_DONGLE);
+                uint16_t plen = xgip_is_chunked(&incoming_xgip)
+                                    ? (uint16_t)incoming_xgip.actual_data_received
+                                    : (uint16_t)xgip_get_data_length(&incoming_xgip);
+
+                if (plen == 0) {
+                    // Stray end-of-chunk terminator with no payload. Forwarding
+                    // an empty auth challenge upsets the controller, so drop it.
+                    printf("[tud_xbone] Ignoring empty auth chunk from console\n");
+                } else {
+                    xbone_auth_set_data(xgip_get_data(&incoming_xgip),
+                                       plen,
+                                       xgip_get_sequence(&incoming_xgip),
+                                       xgip_get_command(&incoming_xgip),
+                                       XBONE_AUTH_SEND_CONSOLE_TO_DONGLE);
+                }
                 xgip_reset(&incoming_xgip);
             }
         }
@@ -372,11 +448,25 @@ bool tud_xbone_send_report(gip_input_report_t* report)
     report->header.length = sizeof(gip_input_report_t) - sizeof(gip_header_t);
 
     if (send_report_internal((uint8_t*)report, sizeof(gip_input_report_t))) {
+        input_reports_sent_to_console++;
         input_report_sequence++;
         if (input_report_sequence == 0) input_report_sequence = 1;
         return true;
     }
     return false;
+}
+
+bool tud_xbone_send_raw(uint8_t const* data, uint16_t len)
+{
+    if (data == NULL || len == 0 || len > XBONE_ENDPOINT_SIZE) {
+        return false;
+    }
+
+    uint8_t buf[XBONE_ENDPOINT_SIZE];
+    memcpy(buf, data, len);
+    queue_report(buf, len);
+    printf("[tud_xbone] Raw relay to console: cmd=0x%02x len=%u\n", data[0], (unsigned)len);
+    return true;
 }
 
 bool tud_xbone_send_virtual_keycode(uint8_t keycode, bool pressed)
@@ -413,9 +503,61 @@ bool tud_xbone_send_guide(bool pressed)
     return tud_xbone_send_virtual_keycode(0x5B, pressed);
 }
 
+// ============================================================================
+// LATE CONTROLLER HANDSHAKE RESTART
+// ============================================================================
+//
+// The console drives announce -> descriptor -> auth exactly once, when our
+// device appears on its bus. A controller that is plugged in afterwards never
+// receives a challenge: it stays in its own auth state, never switches to input
+// reports, and nothing we send afterwards makes the console repeat the
+// exchange. The only reliable way to get such a controller into the exchange is
+// to leave the console's bus and come back, so the console walks the whole
+// handshake again with the controller already attached.
+
+#define REENUM_OFF_MS 250
+
+static uint32_t reenum_start_ms = 0;
+
+bool tud_xbone_handshake_started(void)
+{
+    return driver_state != XBONE_STATE_IDLE &&
+           driver_state != XBONE_STATE_READY_ANNOUNCE;
+}
+
+void tud_xbone_request_reenumeration(void)
+{
+    if (reenum_start_ms != 0) {
+        return;  // one already in flight
+    }
+    printf("[tud_xbone] Controller mounted after handshake started - re-enumerating on console bus\n");
+    tud_disconnect();
+    reenum_start_ms = platform_time_ms();
+}
+
 void tud_xbone_update(void)
 {
     uint32_t now = platform_time_ms();
+
+    // Come back onto the console's bus after a re-enumeration was requested.
+    if (reenum_start_ms != 0 && (now - reenum_start_ms) >= REENUM_OFF_MS) {
+        reenum_start_ms = 0;
+        printf("[tud_xbone] Re-enumeration: reconnecting to console\n");
+        tud_connect();
+    }
+
+    // Heartbeat. It prints whether or not the pad is talking, so "the pad went
+    // silent" can be told apart from "our loop stalled" or "we never forward".
+    {
+        static uint32_t last_status_ms = 0;
+        if ((now - last_status_ms) >= 2000) {
+            last_status_ms = now;
+            printf("[tud_xbone] STATUS t=%lu state=%d powered=%d auth=%d input_sent=%lu\n",
+                   (unsigned long)now, driver_state, xbox_powered_on ? 1 : 0,
+                   auth_data.auth_completed ? 1 : 0,
+                   (unsigned long)input_reports_sent_to_console);
+        }
+    }
 
     // Keep the console from disconnecting (runs every iteration, independent of
     // ACK wait state — GP2040-CE process() does these unconditionally):
@@ -529,6 +671,20 @@ void tud_xbone_update(void)
         case XBONE_STATE_SETUP_AUTH:
             // Handle auth passthrough from dongle to console
             if (auth_data.state == XBONE_AUTH_SEND_DONGLE_TO_CONSOLE) {
+                // The controller resends its response until it is satisfied,
+                // and every resend produced another forward. Each one reset the
+                // console-bound stream to its first chunk, so an 825-byte
+                // signature was only ever emitted as 58 bytes and the console
+                // sat at ACK recv=58 rem=767 forever. Defer the new one until
+                // the stream already on the wire has finished.
+                if (xgip_transfer_in_flight(&outgoing_xgip)) {
+                    // Keep emitting the stream already on the wire and drop
+                    // this forward - the controller resends whatever it still
+                    // wants, so nothing is lost by waiting.
+                    auth_data.state = XBONE_AUTH_WAIT_DONGLE_TO_CONSOLE;
+                    break;
+                }
+
                 bool is_chunked = (auth_data.length > GIP_MAX_CHUNK_SIZE);
                 xgip_reset(&outgoing_xgip);
                 xgip_set_attributes(&outgoing_xgip, auth_data.auth_type,
@@ -536,8 +692,12 @@ void tud_xbone_update(void)
                 xgip_set_data(&outgoing_xgip, auth_data.buffer, auth_data.length);
                 auth_data.state = XBONE_AUTH_WAIT_DONGLE_TO_CONSOLE;
             } else if (auth_data.state == XBONE_AUTH_WAIT_DONGLE_TO_CONSOLE) {
-                queue_report(xgip_generate_packet(&outgoing_xgip),
-                            xgip_get_packet_length(&outgoing_xgip));
+                uint8_t* out = xgip_generate_packet(&outgoing_xgip);
+                printf("[tud_xbone] chunk to console: len=%u payload=%u counter=%u\n",
+                       (unsigned)xgip_get_packet_length(&outgoing_xgip),
+                       (unsigned)out[3],
+                       (unsigned)(out[4] | (out[5] << 8)));
+                queue_report(out, xgip_get_packet_length(&outgoing_xgip));
 
                 if (!xgip_is_chunked(&outgoing_xgip) || xgip_end_of_chunk(&outgoing_xgip)) {
                     auth_data.state = XBONE_AUTH_IDLE;

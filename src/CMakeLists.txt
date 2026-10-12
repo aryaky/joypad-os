@@ -130,6 +130,8 @@ set(CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/leds/player_leds_gpio.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/flash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/gip_map_flash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/uart_cli.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/button/button.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/codes/codes.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/keymap/keymap.c

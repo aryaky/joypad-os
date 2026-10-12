@@ -47,6 +47,10 @@ bool tud_xbone_ready(void);
 // Send input report to console
 bool tud_xbone_send_report(gip_input_report_t* report);
 
+// Queue a raw GIP packet (as received from the controller) for delivery to the
+// console, untouched. Used for byte-level auth passthrough.
+bool tud_xbone_send_raw(uint8_t const* data, uint16_t len);
+
 // Send a GIP_VIRTUAL_KEYCODE press/release. Real Xbox controllers raise the
 // Guide button this way (keycode 0x5B); the bit in the standard input report
 // alone does NOT open the Guide overlay on console.
@@ -57,6 +61,17 @@ bool tud_xbone_send_guide(bool pressed);
 
 // Update driver (called from task loop)
 void tud_xbone_update(void);
+
+// True once we have announced ourselves to the console. A controller that
+// mounts after this point arrived too late to take part in the exchange the
+// console is already driving, so the handshake has to be restarted.
+bool tud_xbone_handshake_started(void);
+
+// Drop off the console's USB bus and come back, so the console runs
+// announce -> descriptor -> auth again from the top. This is what makes a
+// controller that is plugged in after the board booted work: the console
+// drives the whole exchange once at connect time and never repeats it.
+void tud_xbone_request_reenumeration(void);
 
 // Vendor control transfer callback (for Windows OS descriptors)
 bool tud_xbone_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,

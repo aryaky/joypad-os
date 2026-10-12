@@ -27,6 +27,8 @@
 #include "core/app_registry.h"
 #include "core/input_interface.h"
 #include "core/output_interface.h"
+#include "core/uart_cli.h"
+#include "core/services/storage/gip_map_flash.h"
 #include "core/services/players/manager.h"
 #include "core/services/leds/leds.h"
 #include "core/services/storage/storage.h"
@@ -112,6 +114,7 @@ static void __not_in_flash_func(core0_main)(void)
     players_task();
     if (first_loop) printf("[joypad] Loop: storage\n");
     storage_task();
+    uart_cli_task();
 
     // Poll all input interfaces FIRST so output reads freshest data this iteration
     // (Eliminates one-loop-iteration latency vs polling input after output)
@@ -214,6 +217,8 @@ int main(void)
   // Core 1 is already listening for console probes while this runs.
   leds_init();
   storage_init();
+  // Pick up a button map downloaded over the wire, if one was stored.
+  gip_map_init();
   players_init();
   app_init();
 
