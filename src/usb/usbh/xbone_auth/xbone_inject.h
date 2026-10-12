@@ -22,8 +22,15 @@
 
 void xbone_inject_init(void);
 
-// 每个准备转发给主机的手柄输入报告都先过这里。返回 true 表示 report 被改写过。
-// 只在"正在按下"的那段时间改写；松开期间一个字节都不动，手柄真实的扳机值原样通过。
+// 虚拟左扳机此刻的值（0 或 1023）。
+//
+// 纯函数：只根据时间算，随时可以问，不改变内部状态。这样"合并进转发的包"和
+// "自己生成一份报告"两条路可以共用同一个值，不会各走一套计时。
+uint16_t xbone_inject_trigger_value(uint32_t now_ms);
+
+// 把虚拟扳机合并进一份准备转发给主机的手柄输入报告。返回 true 表示 report 被
+// 改写过。只在"正在按下"的那段时间改写；松开期间一个字节都不动，手柄真实的
+// 扳机值原样通过。
 bool xbone_inject_apply(uint8_t* report, uint16_t len, uint32_t now_ms);
 
 // 组合键检测。jp_buttons 是手柄原始按键字经 gip_button_map 翻译后的 JP_BUTTON_* 掩码。

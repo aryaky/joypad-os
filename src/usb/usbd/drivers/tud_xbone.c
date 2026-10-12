@@ -8,9 +8,20 @@
 #include <stdio.h>
 #include "../tusb_compat.h"  // usbd_edpt_xfer is_isr shim (0.20.0 vs master)
 #include "../../usbh/xbone_auth/xbone_auth.h"
+#include "../../usbh/xbone_auth/xbone_inject.h"
 
 // Forward declaration for auth passthrough check (weak - returns false if not linked)
 __attribute__((weak)) bool xbone_auth_is_available(void) { return false; }
+
+// Weak stubs so the driver still links when the auth / inject modules aren't
+// part of the build.
+__attribute__((weak)) uint32_t xbone_auth_last_pad_relay_ms(void) { return 0; }
+__attribute__((weak)) bool xbone_inject_is_running(void) { return false; }
+__attribute__((weak)) uint16_t xbone_inject_trigger_value(uint32_t now_ms)
+{
+    (void)now_ms;
+    return 0;
+}
 
 // Weak stub so the driver still links when the auth module isn't part of the build
 __attribute__((weak)) bool xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
@@ -35,6 +46,11 @@ __attribute__((weak)) bool xbone_auth_send_raw_to_controller(uint8_t const* repo
 #define ACK_WAIT_TIMEOUT       2000  // ms to wait for ACK
 #define IDLE_REPORT_INTERVAL   25    // ms between idle reports during auth
 #define KEEPALIVE_INTERVAL     15000 // ms between keep-alive packets after auth
+
+// 手柄沉默多久算"这条流断了"。真手柄是 250Hz，给 50ms 的余量足够宽松。
+#define PAD_STREAM_IDLE_MS     50
+// 手柄不说话时，我们自己发报告的节拍（和 auth 期间的 idle 报告一致）
+#define INJECT_REPORT_INTERVAL IDLE_REPORT_INTERVAL
 
 // Vendor request types
 #define USB_SETUP_DEVICE_TO_HOST       0x80
@@ -157,6 +173,10 @@ static uint8_t input_report_sequence = 1;
 static uint8_t keepalive_sequence = 1;
 static uint32_t last_idle_report_ms = 0;
 static uint32_t last_keepalive_ms = 0;
+
+// 注入自己撑起报告流时的节拍与计数（只在手柄沉默的那条路上用）
+static uint32_t last_inject_report_ms = 0;
+static uint32_t inject_reports_sent = 0;
 
 // Idle gamepad payload sent during auth — matches GP2040-CE xboneIdle (32 data bytes)
 static const uint8_t xbone_idle_payload[] = {
@@ -728,6 +748,36 @@ void tud_xbone_update(void)
                     keepalive_sequence++;
                     if (keepalive_sequence == 0) keepalive_sequence = 1;
                     last_keepalive_ms = now;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 注入：启动之后必须按时把左扳机发出去，在主机看来就是手柄自己按的。
+    //
+    // 手柄在说话时，虚拟扳机是**合并**进转发的包里的（见 xbone_auth.c 的
+    // GIP_INPUT_REPORT 分支），手柄的按键和摇杆都保留。手柄沉默时没有包可合并，
+    // 这里就必须由我们自己把报告流撑起来 —— 否则按了"启动"等于什么都没发生。
+    // 两条路共用 xbone_inject_trigger_value()，不会各走一套计时。
+    // ------------------------------------------------------------------------
+    if (xbone_inject_is_running()) {
+        uint32_t last_pad = xbone_auth_last_pad_relay_ms();
+        bool pad_quiet = (last_pad == 0) || ((now - last_pad) >= PAD_STREAM_IDLE_MS);
+
+        if (pad_quiet && (now - last_inject_report_ms) >= INJECT_REPORT_INTERVAL) {
+            // 静止的中位摇杆 + 虚拟扳机。和 auth 期间那份 idle 报告同构。
+            gip_input_report_t rep = { 0 };
+            rep.left_trigger = xbone_inject_trigger_value(now);
+
+            if (tud_xbone_send_report(&rep)) {
+                last_inject_report_ms = now;
+                inject_reports_sent++;
+                if ((inject_reports_sent & 0x3F) == 0) {
+                    printf("[tud_xbone] Inject driving report stream: n=%lu lt=%u (pad quiet %lums)\n",
+                           (unsigned long)inject_reports_sent,
+                           (unsigned)rep.left_trigger,
+                           (unsigned long)(last_pad ? (now - last_pad) : now));
                 }
             }
         }

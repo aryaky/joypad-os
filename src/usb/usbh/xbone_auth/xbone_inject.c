@@ -114,10 +114,9 @@ void xbone_inject_init(void)
     register_combos();
 }
 
-bool xbone_inject_apply(uint8_t* report, uint16_t len, uint32_t now_ms)
+uint16_t xbone_inject_trigger_value(uint32_t now_ms)
 {
-    if (!running) return false;
-    if (report == NULL || len < (LT_OFFSET + LT_BYTES)) return false;
+    if (!running) return 0;
 
     uint32_t phase = now_ms - cycle_start_ms;
     if (phase >= interval_ms) {
@@ -136,13 +135,21 @@ bool xbone_inject_apply(uint8_t* report, uint16_t len, uint32_t now_ms)
                (unsigned)interval_ms, (unsigned)pulse_ms);
     }
 
-    if (!should_press) {
+    return should_press ? LT_PRESSED : 0;
+}
+
+bool xbone_inject_apply(uint8_t* report, uint16_t len, uint32_t now_ms)
+{
+    if (report == NULL || len < (LT_OFFSET + LT_BYTES)) return false;
+
+    uint16_t value = xbone_inject_trigger_value(now_ms);
+    if (value == 0) {
         // 松开期间一个字节都不动：手柄自己真实的扳机值必须原样到主机
         return false;
     }
 
-    report[LT_OFFSET]     = (uint8_t)(LT_PRESSED & 0xFF);
-    report[LT_OFFSET + 1] = (uint8_t)((LT_PRESSED >> 8) & 0xFF);
+    report[LT_OFFSET]     = (uint8_t)(value & 0xFF);
+    report[LT_OFFSET + 1] = (uint8_t)((value >> 8) & 0xFF);
     return true;
 }
 

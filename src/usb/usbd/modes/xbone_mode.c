@@ -6,6 +6,7 @@
 #include "../usbd_mode.h"
 #include "../usbd.h"
 #include "../drivers/tud_xbone.h"
+#include "../../usbh/xbone_auth/xbone_inject.h"
 #include "descriptors/xbone_descriptors.h"
 #include "core/buttons.h"
 #include <string.h>
@@ -62,6 +63,10 @@ static bool xbone_mode_send_report(uint8_t player_index,
     // the pad sent (see the PADRX line) so a mapping mistake shows up as a
     // mismatch between the two instead of as a silent console.
     printf("[xbone_mode] out buttons=0x%08lx\n", (unsigned long)buttons);
+
+    // 组合键也接在这条路上。注入的启停如果只认手柄原始 GIP 报告，一旦手柄不开口
+    // 就等于完全没法操作；归一化管线是第二处能拿到按键状态的地方。
+    xbone_inject_feed_buttons((uint16_t)buttons, 0);
 
     // Clear report
     memset(&xbone_report, 0, sizeof(gip_input_report_t));

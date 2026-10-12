@@ -105,6 +105,10 @@ static uint16_t relay_last_lt      = 0xFFFF;
 static uint32_t relay_last_log_ms;
 static uint32_t relay_input_count;
 static uint32_t relay_fail_tick;
+
+// 最近一次真的从手柄收到输入报告的时刻。设备侧靠它判断"手柄这条流还活着吗" ——
+// 手柄沉默时不能干等，注入得由我们自己把报告流撑起来。
+static uint32_t relay_last_rx_ms;
 static uint32_t last_input_nudge_ms = 0;
 static uint8_t input_nudges = 0;
 
@@ -413,6 +417,11 @@ static bool send_to_dongle(uint8_t* report, uint16_t len)
 // ============================================================================
 // PUBLIC API
 // ============================================================================
+
+uint32_t xbone_auth_last_pad_relay_ms(void)
+{
+    return relay_last_rx_ms;
+}
 
 void xbone_auth_init(void)
 {
@@ -1035,6 +1044,7 @@ void xbone_auth_report_received(uint8_t dev_addr, uint8_t instance,
 
                 bool sent = tud_xbone_send_raw(pkt, pkt_len);
                 relay_input_count++;
+                relay_last_rx_ms = platform_time_ms();
 
                 uint16_t btns = (pkt_len >= 6)
                                     ? (uint16_t)(pkt[4] | ((uint16_t)pkt[5] << 8)) : 0;

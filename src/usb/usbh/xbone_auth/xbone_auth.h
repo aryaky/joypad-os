@@ -25,6 +25,12 @@ bool xbone_auth_is_available(void);
 // Check if auth is complete
 bool xbone_auth_is_complete(void);
 
+// platform_time_ms() of the last input report we actually received from the
+// controller, 0 if none yet. The device side uses it to tell "the pad is
+// feeding us a stream" from "the pad is silent and we have to drive the report
+// stream ourselves" - injection must work either way.
+uint32_t xbone_auth_last_pad_relay_ms(void);
+
 // Task to process auth passthrough (call from main loop)
 void xbone_auth_task(void);
 
