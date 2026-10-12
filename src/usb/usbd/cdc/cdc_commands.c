@@ -13,6 +13,8 @@
 #include "core/services/profiles/profile.h"
 #include "core/services/storage/gip_map_flash.h"
 #include "gip_button_map.h"
+#include "usb/usbd/drivers/tud_xbone.h"
+#include "usb/usbh/xbone_auth/xbone_inject.h"
 #include "core/services/players/manager.h"
 #include "core/services/players/feedback.h"
 #include "platform/platform.h"
@@ -4313,6 +4315,84 @@ typedef struct {
     cmd_handler_t handler;
 } cmd_entry_t;
 
+// ============================================================================
+// 透传 / 注入（板子是 Xbox 手柄 -> Xbox 主机的中转器）
+// ============================================================================
+
+// XBINJ.STATUS
+static void cmd_xbinj_status(const char* json)
+{
+    (void)json;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"running\":%s,\"interval_ms\":%u,\"pulse_ms\":%u,"
+             "\"chunk_mode\":\"%s\",\"desc_mode\":\"%s\"}",
+             xbone_inject_is_running() ? "true" : "false",
+             (unsigned)xbone_inject_interval_ms(),
+             (unsigned)xbone_inject_pulse_ms(),
+             xbone_get_chunk_mode() == XBONE_CHUNK_RELAY ? "relay" : "rechunk",
+             xbone_get_desc_mode() == XBONE_DESC_SELF ? "self" : "pad");
+    send_json(response_buf);
+}
+
+// XBINJ.SET  {"on":true} {"interval":10000} {"pulse":500}  - 字段任选
+static void cmd_xbinj_set(const char* json)
+{
+    bool on;
+    if (json_get_bool(json, "on", &on)) {
+        xbone_inject_set_running(on);
+    }
+
+    int v;
+    if (json_get_int(json, "interval", &v)) {
+        // 串口给的是毫秒，和 STATUS 报的单位一致
+        xbone_inject_set_interval_ms((uint32_t)v);
+    }
+    if (json_get_int(json, "pulse", &v)) {
+        xbone_inject_set_pulse_ms((uint32_t)v);
+    }
+
+    cmd_xbinj_status(json);
+}
+
+// json_get_string() hands back a slice of the input that ends at the closing
+// quote, not at a NUL, so strcmp would run past it. Compare with a length.
+static bool json_str_is(const char* json, const char* key, const char* want)
+{
+    int len = 0;
+    const char* got = json_get_string(json, key, &len);
+    if (got == NULL) return false;
+    size_t want_len = strlen(want);
+    return ((size_t)len == want_len) && (strncmp(got, want, want_len) == 0);
+}
+
+// XRELAY.MODE  {"mode":"relay"|"rechunk"}
+static void cmd_xrelay_mode(const char* json)
+{
+    if (json_str_is(json, "mode", "relay")) {
+        xbone_set_chunk_mode(XBONE_CHUNK_RELAY);
+    } else if (json_str_is(json, "mode", "rechunk")) {
+        xbone_set_chunk_mode(XBONE_CHUNK_RECHUNK);
+    } else {
+        send_error("expected {\"mode\":\"relay\"|\"rechunk\"}");
+        return;
+    }
+    cmd_xbinj_status(json);
+}
+
+// XDESC.MODE  {"mode":"self"|"pad"}
+static void cmd_xdesc_mode(const char* json)
+{
+    if (json_str_is(json, "mode", "self")) {
+        xbone_set_desc_mode(XBONE_DESC_SELF);
+    } else if (json_str_is(json, "mode", "pad")) {
+        xbone_set_desc_mode(XBONE_DESC_FROM_PAD);
+    } else {
+        send_error("expected {\"mode\":\"self\"|\"pad\"}");
+        return;
+    }
+    cmd_xbinj_status(json);
+}
+
 static const cmd_entry_t commands[] = {
     {"INFO", cmd_info},
     {"SINPUT.DBG", cmd_sinput_dbg},
@@ -4455,6 +4535,10 @@ static const cmd_entry_t commands[] = {
     {"GIPMAP.GET",     cmd_gipmap_get},
     {"GIPMAP.SET",     cmd_gipmap_set},
     {"GIPMAP.RESET",   cmd_gipmap_reset},
+    {"XBINJ.STATUS",   cmd_xbinj_status},
+    {"XBINJ.SET",      cmd_xbinj_set},
+    {"XRELAY.MODE",    cmd_xrelay_mode},
+    {"XDESC.MODE",     cmd_xdesc_mode},
     {NULL, NULL}
 };
 

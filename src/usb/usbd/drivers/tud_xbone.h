@@ -49,7 +49,36 @@ bool tud_xbone_send_report(gip_input_report_t* report);
 
 // Queue a raw GIP packet (as received from the controller) for delivery to the
 // console, untouched. Used for byte-level auth passthrough.
+//
+// Kept quiet on purpose: input reports run at 250 Hz and every caller has its
+// own log policy, so printing in here would flood the UART.
 bool tud_xbone_send_raw(uint8_t const* data, uint16_t len);
+
+// ============================================================================
+// 两个运行时可切的协议策略（串口命令改，不用重新刷机就能 A/B）
+// ============================================================================
+
+// 分片策略。手柄直插 Xbox 时用的就是它自己的分片大小，主机天然接受 —— 所以
+// "照抄对端分片逐包转发"才是中转器该有的默认动作。
+//   RELAY   = 收到什么分片就发什么分片，逐包原样转发
+//   RECHUNK = 先把整段重组，再按我们自己的分片发给主机（历史做法）
+typedef enum {
+    XBONE_CHUNK_RELAY   = 0,
+    XBONE_CHUNK_RECHUNK = 1,
+} xbone_chunk_mode_t;
+
+void               xbone_set_chunk_mode(xbone_chunk_mode_t mode);
+xbone_chunk_mode_t xbone_get_chunk_mode(void);
+
+// 设备描述符由谁回答。SELF = 我们用硬编码描述符冒充手柄（历史做法）；
+// FROM_PAD = 把请求转给手柄，用它的真描述符回答主机。
+typedef enum {
+    XBONE_DESC_SELF    = 0,
+    XBONE_DESC_FROM_PAD = 1,
+} xbone_desc_mode_t;
+
+void              xbone_set_desc_mode(xbone_desc_mode_t mode);
+xbone_desc_mode_t xbone_get_desc_mode(void);
 
 // Send a GIP_VIRTUAL_KEYCODE press/release. Real Xbox controllers raise the
 // Guide button this way (keycode 0x5B); the bit in the standard input report

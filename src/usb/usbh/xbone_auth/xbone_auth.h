@@ -45,7 +45,10 @@ void xbone_auth_xmount(uint8_t dev_addr, uint8_t instance,
 // Queue a raw GIP packet (console → controller) for delivery to the controller.
 // Used to pass through power-mode / rumble / wakeup commands that the console
 // sends us: without them a wired pad never starts emitting input reports.
-void xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len);
+// Returns false when the packet could not be queued. Callers log it: a dropped
+// forward used to be invisible, which made every "the pad never reacted" look
+// like a pad-side problem.
+bool xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len);
 
 // Tell the auth layer that the console closed the auth exchange (auth marker
 // 01 02). The console never sends the GIP_AUTH COMPLETE control packet itself,

@@ -13,9 +13,10 @@
 __attribute__((weak)) bool xbone_auth_is_available(void) { return false; }
 
 // Weak stub so the driver still links when the auth module isn't part of the build
-__attribute__((weak)) void xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
+__attribute__((weak)) bool xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
 {
     (void)report; (void)len;
+    return false;
 }
 
 // ============================================================================
@@ -43,6 +44,37 @@ __attribute__((weak)) void xbone_auth_send_raw_to_controller(uint8_t const* repo
 
 #define REQ_GET_OS_FEATURE_DESCRIPTOR  0x20
 #define DESC_EXTENDED_COMPATIBLE_ID    0x0004
+
+// ----------------------------------------------------------------------------
+// 两个运行时可切的协议策略（定义在文件前部：下面的转发分发要用）
+// ----------------------------------------------------------------------------
+
+static xbone_chunk_mode_t chunk_mode = XBONE_CHUNK_RELAY;
+static xbone_desc_mode_t  desc_mode  = XBONE_DESC_SELF;
+
+void xbone_set_chunk_mode(xbone_chunk_mode_t mode)
+{
+    chunk_mode = mode;
+    printf("[tud_xbone] chunk mode = %s\n",
+           mode == XBONE_CHUNK_RELAY ? "RELAY (verbatim)" : "RECHUNK");
+}
+
+xbone_chunk_mode_t xbone_get_chunk_mode(void)
+{
+    return chunk_mode;
+}
+
+void xbone_set_desc_mode(xbone_desc_mode_t mode)
+{
+    desc_mode = mode;
+    printf("[tud_xbone] descriptor mode = %s\n",
+           mode == XBONE_DESC_SELF ? "SELF (hardcoded)" : "FROM_PAD (relayed)");
+}
+
+xbone_desc_mode_t xbone_get_desc_mode(void)
+{
+    return desc_mode;
+}
 
 // ============================================================================
 // STATE
@@ -146,10 +178,18 @@ static uint8_t get_index_by_itfnum(uint8_t itf_num)
     return 0xFF;
 }
 
-static void queue_report(uint8_t* report, uint16_t len)
+// Returns false when the packet was dropped. A drop used to be silent - the
+// queue just returned - which made every "the console never saw it" look like a
+// console-side problem. Throttled because the input path calls this at 250 Hz.
+static bool queue_report(uint8_t* report, uint16_t len)
 {
     if (queue_count >= REPORT_QUEUE_SIZE) {
-        return;  // Queue full
+        static uint32_t drop_tick = 0;
+        if ((drop_tick++ & 0x3F) == 0) {
+            printf("[tud_xbone] DROP: queue full, cmd=0x%02x len=%u dropped_so_far=%u\n",
+                   report[0], (unsigned)len, (unsigned)drop_tick);
+        }
+        return false;
     }
 
     memcpy(report_queue[queue_tail].report, report, len);
@@ -157,6 +197,7 @@ static void queue_report(uint8_t* report, uint16_t len)
 
     queue_tail = (queue_tail + 1) % REPORT_QUEUE_SIZE;
     queue_count++;
+    return true;
 }
 
 static bool dequeue_report(uint8_t* report, uint16_t* len)
@@ -352,19 +393,37 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
         if (cmd == GIP_ACK_RESPONSE) {
             waiting_ack = false;
         } else if (cmd == GIP_DEVICE_DESCRIPTOR) {
-            // Console requested descriptor
-            xgip_reset(&outgoing_xgip);
-            xgip_set_attributes(&outgoing_xgip, GIP_DEVICE_DESCRIPTOR,
-                               xgip_get_sequence(&incoming_xgip), 1, 1, 0);
-            xgip_set_data(&outgoing_xgip, xbone_gip_descriptor, sizeof(xbone_gip_descriptor));
-            driver_state = XBONE_STATE_SEND_DESCRIPTOR;
+            // Console requested descriptor.
+            //
+            // SELF answers with our hardcoded descriptor; FROM_PAD forwards the
+            // request to the pad so the console gets the pad's *real* one. The
+            // pad is an ordinary Xbox pad, so its descriptor is exactly what the
+            // console would have read from it directly - relaying it is the
+            // honest answer for a pass-through box, and it removes the guess
+            // that our hardcoded copy happens to match.
+            if (desc_mode == XBONE_DESC_FROM_PAD) {
+                bool fwd = xbone_auth_send_raw_to_controller(p_xbone->epout_buf,
+                                                             (uint16_t)xferred_bytes);
+                printf("[tud_xbone] Descriptor request -> controller: %s\n",
+                       fwd ? "sent" : "FAILED");
+            } else {
+                printf("[tud_xbone] Descriptor request -> answering with hardcoded descriptor\n");
+                xgip_reset(&outgoing_xgip);
+                xgip_set_attributes(&outgoing_xgip, GIP_DEVICE_DESCRIPTOR,
+                                   xgip_get_sequence(&incoming_xgip), 1, 1, 0);
+                xgip_set_data(&outgoing_xgip, xbone_gip_descriptor, sizeof(xbone_gip_descriptor));
+                driver_state = XBONE_STATE_SEND_DESCRIPTOR;
+            }
         } else if (cmd == GIP_POWER_MODE_DEVICE_CONFIG || cmd == GIP_CMD_WAKEUP || cmd == GIP_CMD_RUMBLE) {
             xbox_powered_on = true;
             // The console is telling "us" (the virtual pad) to power on / rumble.
             // A wired GIP pad only starts emitting 0x20 input reports after it
             // receives these from its host, so pass them through untouched -
             // otherwise auth succeeds (guide LED solid) but no input ever flows.
-            xbone_auth_send_raw_to_controller(p_xbone->epout_buf, (uint16_t)xferred_bytes);
+            bool fwd = xbone_auth_send_raw_to_controller(p_xbone->epout_buf,
+                                                         (uint16_t)xferred_bytes);
+            printf("[tud_xbone] Passthrough -> controller: cmd=0x%02x len=%u %s\n",
+                   cmd, (unsigned)xferred_bytes, fwd ? "sent" : "FAILED");
         } else if (cmd == GIP_AUTH || cmd == GIP_FINAL_AUTH) {
             // Check for auth complete marker. These are non-chunked packets, for
             // which the parser never populates the data pointer, so read the raw
@@ -394,7 +453,24 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
             // Reassemble the console's chunked challenge first: relaying the raw
             // chunks straight to the controller was tried and the console stopped
             // accepting us, so keep the reassemble-then-rechunk path.
-            if (!xgip_is_chunked(&incoming_xgip) ||
+            if (chunk_mode == XBONE_CHUNK_RELAY && xgip_is_chunked(&incoming_xgip)) {
+                // 照抄主机发来的分片，逐包原样转发给手柄。
+                //
+                // 手柄直插 Xbox 时用的就是它自己的分片大小，主机天然接受。所以
+                // "两边分片不一致"是我们自己造出来的：之前是重组再重新分片，然后
+                // 为了让两边账目对得上，又长出一整堆 ACK 记账补丁。照抄之后这些
+                // 都不需要了。
+                //
+                // 只转发分片数据；非分片的认证标记（01 01 / 01 02）是主机发给
+                // *我们*的控制包，转给手柄没有意义，仍走下面的本地处理。
+                bool fwd = xbone_auth_send_raw_to_controller(p_xbone->epout_buf,
+                                                             (uint16_t)xferred_bytes);
+                printf("[tud_xbone] Auth chunk RELAY -> controller: wire=%u/%u %s\n",
+                       (unsigned)incoming_xgip.chunk_counter,
+                       (unsigned)incoming_xgip.total_chunk_length,
+                       fwd ? "sent" : "FAILED");
+                xgip_reset(&incoming_xgip);
+            } else if (!xgip_is_chunked(&incoming_xgip) ||
                 (xgip_is_chunked(&incoming_xgip) && xgip_end_of_chunk(&incoming_xgip))) {
 
                 uint16_t plen = xgip_is_chunked(&incoming_xgip)
@@ -414,6 +490,16 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
                 }
                 xgip_reset(&incoming_xgip);
             }
+        } else {
+            // 白名单之外一律原样转发给手柄。
+            //
+            // 这一支以前是空的：命令被静默丢弃，连日志都没有。于是"我们漏掉了
+            // 什么"这件事本身是不可见的 —— 每次排查都只能靠猜。转发并打印之后，
+            // 至少能看见主机到底在跟我们要什么。
+            bool fwd = xbone_auth_send_raw_to_controller(p_xbone->epout_buf,
+                                                         (uint16_t)xferred_bytes);
+            printf("[tud_xbone] Unlisted cmd -> controller: cmd=0x%02x len=%u %s\n",
+                   cmd, (unsigned)xferred_bytes, fwd ? "sent" : "FAILED");
         }
 
         // Ready for next packet
@@ -488,10 +574,11 @@ bool tud_xbone_send_raw(uint8_t const* data, uint16_t len)
 
     uint8_t buf[XBONE_ENDPOINT_SIZE];
     memcpy(buf, data, len);
-    queue_report(buf, len);
-    printf("[tud_xbone] Raw relay to console: cmd=0x%02x len=%u\n", data[0], (unsigned)len);
-    return true;
+    // 打印交给调用方：输入报告是 250 Hz，在这里打会淹掉串口
+    return queue_report(buf, len);
 }
+
+
 
 bool tud_xbone_send_virtual_keycode(uint8_t keycode, bool pressed)
 {

@@ -3,8 +3,10 @@
 // Based on GP2040-CE implementation (gp2040-ce.info)
 
 #include "xbone_auth.h"
+#include "xbone_inject.h"
 #include "usb/usbd/drivers/xgip_protocol.h"
 #include "usb/usbd/drivers/tud_xbone.h"
+#include "gip_button_map.h"
 #include "platform/platform.h"
 #include "tusb.h"
 #include <string.h>
@@ -95,6 +97,14 @@ static uint32_t last_handshake_restart_ms = 0;
 static uint8_t handshake_restarts = 0;
 
 static uint32_t last_input_report_ms = 0;
+
+// 转发给主机的输入报告的日志状态。输入报告是 250 Hz，逐包打印会淹掉串口也会
+// 拖慢主循环（v3x 上试过，循环直接被拖住），所以"变化即打 + 每秒一条摘要"。
+static uint16_t relay_last_buttons = 0xFFFF;
+static uint16_t relay_last_lt      = 0xFFFF;
+static uint32_t relay_last_log_ms;
+static uint32_t relay_input_count;
+static uint32_t relay_fail_tick;
 static uint32_t last_input_nudge_ms = 0;
 static uint8_t input_nudges = 0;
 
@@ -200,20 +210,21 @@ extern bool tuh_xinput_send_report(uint8_t dev_addr, uint8_t instance,
                                    uint8_t const* report, uint16_t len);
 extern bool tuh_xinput_abort_out(uint8_t dev_addr, uint8_t instance);
 
-void xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
+bool xbone_auth_send_raw_to_controller(uint8_t const* report, uint16_t len)
 {
     if (len == 0 || len > sizeof(report_queue[0].report)) {
-        return;
+        return false;
     }
     if (queue_count >= REPORT_QUEUE_SIZE) {
         printf("[xbone_auth] raw passthrough queue full, dropping cmd=0x%02x\n", report[0]);
-        return;
+        return false;
     }
     printf("[xbone_auth] Raw passthrough to controller: cmd=0x%02x len=%d\n", report[0], len);
     memcpy(report_queue[queue_tail].report, report, len);
     report_queue[queue_tail].len = len;
     queue_tail = (queue_tail + 1) % REPORT_QUEUE_SIZE;
     queue_count++;
+    return true;
 }
 
 // Power-on sequence shared by the descriptor-reply path, the announce timeout
@@ -407,6 +418,10 @@ void xbone_auth_init(void)
 {
     xgip_init(&incoming_xgip);
     xgip_init(&outgoing_xgip);
+
+    // 注入引擎在这里挂上来：它活在"手柄 -> 主机"的转发路径上，而转发就在这个
+    // 模块里做，所以初始化跟它绑在一起。
+    xbone_inject_init();
 
     xbone_dev_addr = 0;
     xbone_instance = 0;
@@ -900,11 +915,16 @@ void xbone_auth_report_received(uint8_t dev_addr, uint8_t instance,
         // we reassembled the first time round is the total it is working to.
         uint8_t fseq = xgip_get_sequence(&incoming_xgip);
         uint16_t saved_data_length = incoming_xgip.data_length;
-        if (forwarded_seq[fseq] && forwarded_seq_len[fseq] > incoming_xgip.data_length) {
-            incoming_xgip.data_length = forwarded_seq_len[fseq];
-        }
 
-        incoming_xgip.ack_echo_peer_counter = ack_wire_currency;
+        // 下面两处都是跨链路记账：拿另一端记住的长度 / 另一端的 ACK 计数器来改
+        // 这一端要报的 ACK。它们只在"两边分片不一致"时才需要 —— 那是我们自己造
+        // 出来的不一致。RELAY 模式下分片照抄，两个链路各算各的账，这些都不要。
+        if (xbone_get_chunk_mode() == XBONE_CHUNK_RECHUNK) {
+            if (forwarded_seq[fseq] && forwarded_seq_len[fseq] > incoming_xgip.data_length) {
+                incoming_xgip.data_length = forwarded_seq_len[fseq];
+            }
+            incoming_xgip.ack_echo_peer_counter = ack_wire_currency;
+        }
         uint8_t* ack = xgip_generate_ack(&incoming_xgip);
         incoming_xgip.data_length = saved_data_length;
         uint16_t ack_val = (uint16_t)(ack[7] | ((uint16_t)ack[8] << 8));
@@ -960,17 +980,95 @@ void xbone_auth_report_received(uint8_t dev_addr, uint8_t instance,
                        cmd, len, xgip_is_chunked(&incoming_xgip));
             }
 
+            // 两条路，运行时可切：
+            //
+            // RELAY：逐包原样转发手柄的分片。手柄直插主机时用的就是这个分片大小，
+            //   主机天然接受，所以两个链路的分片本来就该是一致的。
+            //
+            // RECHUNK：先重组整段，再按我们自己的分片发给主机（历史做法）。
+            //
+            // 注释里"试过直接转发原始分片、主机就不认了"那次实验，是在 ACK 记账
+            // 错误、AUTH COMPLETE 还没合成等问题都还在的时候做的，结论被污染了。
+            // 现在做成开关重做一次，而不是把那次结果当定论。
+            if (xbone_get_chunk_mode() == XBONE_CHUNK_RELAY) {
+                uint8_t pkt[64];
+                uint16_t n = (len > sizeof(pkt)) ? (uint16_t)sizeof(pkt) : len;
+                memcpy(pkt, report, n);
+                bool sent = tud_xbone_send_raw(pkt, n);
+                if (!throttled || !sent) {
+                    printf("[xbone_auth] Auth chunk RELAY -> console: cmd=0x%02x len=%u wire=%u %s\n",
+                           cmd, n, (unsigned)incoming_xgip.chunk_counter,
+                           sent ? "sent" : "FAILED");
+                }
+                break;
+            }
+
             // Reassemble the controller's chunked response, then hand the
             // payload to the device driver which re-chunks it for the console.
-            // Relaying the controller's raw chunks instead was tried and the
-            // console stopped accepting the controller, so don't do that.
             if (!xgip_is_chunked(&incoming_xgip) || xgip_end_of_chunk(&incoming_xgip)) {
                 forward_auth_response();
             }
             break;
 
+        case GIP_INPUT_REPORT:
+            // 主干：手柄的输入报告原样转发给主机。
+            //
+            // 这条链路上以前根本不存在转发。上游 joypad-os 的范式是"输入归一化
+            // 再转换成输出协议"，没有"输入原样透传给输出"这条路 —— 所以手柄就算
+            // 开口说话，数据也到不了主机。板子是中转器，缺的就是这一环。
+            {
+                uint8_t pkt[64];
+                uint16_t pkt_len = (len > sizeof(pkt)) ? (uint16_t)sizeof(pkt) : len;
+                memcpy(pkt, report, pkt_len);
+
+                // 组合键用手柄自己的按键字判定，读的是改写前的原始值，所以注入
+                // 出来的扳机不会被当成组合键输入。
+                if (pkt_len >= 6) {
+                    uint16_t raw_btns = (uint16_t)(pkt[4] | ((uint16_t)pkt[5] << 8));
+                    xbone_inject_feed_buttons(
+                        gip_button_map_apply(gip_button_map_current(), raw_btns),
+                        platform_time_ms());
+                }
+
+                // 注入：只有"正在按下"的那段时间改写左扳机，其余字节一个都不动
+                bool injected = xbone_inject_apply(pkt, pkt_len, platform_time_ms());
+
+                bool sent = tud_xbone_send_raw(pkt, pkt_len);
+                relay_input_count++;
+
+                uint16_t btns = (pkt_len >= 6)
+                                    ? (uint16_t)(pkt[4] | ((uint16_t)pkt[5] << 8)) : 0;
+                uint16_t lt   = (pkt_len >= 8)
+                                    ? (uint16_t)(pkt[6] | ((uint16_t)pkt[7] << 8)) : 0;
+                uint32_t now  = platform_time_ms();
+
+                if (!sent) {
+                    if ((relay_fail_tick++ & 0x3F) == 0) {
+                        printf("[xbone_auth] Relay input FAILED: n=%u\n",
+                               (unsigned)relay_input_count);
+                    }
+                } else if ((btns != relay_last_buttons) || (lt != relay_last_lt) ||
+                           injected || (now - relay_last_log_ms) >= 1000u) {
+                    printf("[xbone_auth] Relay input -> console: n=%u btns=0x%04x lt=%u%s\n",
+                           (unsigned)relay_input_count, btns, lt,
+                           injected ? " [INJECTED-LT]" : "");
+                    relay_last_buttons = btns;
+                    relay_last_lt = lt;
+                    relay_last_log_ms = now;
+                }
+            }
+            break;
+
         case GIP_ACK_RESPONSE:
+            // 手柄发给我们的 ACK，是"我们发给它"的回执，主机那边的账不是同一本
+            break;
+
         default:
+            // 丢弃必须可见 —— 静默丢弃等于我们永远看不见自己漏了什么
+            printf("[xbone_auth] Unhandled report from controller: cmd=0x%02x len=%d bytes=%02x %02x %02x %02x\n",
+                   cmd, len,
+                   len > 0 ? report[0] : 0, len > 1 ? report[1] : 0,
+                   len > 2 ? report[2] : 0, len > 3 ? report[3] : 0);
             break;
     }
 }
