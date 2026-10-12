@@ -70,6 +70,23 @@ static bool xbox_powered_on = false;
 static bool waiting_ack = false;
 static uint32_t waiting_ack_timeout = 0;
 
+// Console-side attach observability.
+//
+// Why this exists: the device port had NO way to tell whether anything was even
+// attached. There is no VBUS sense printed anywhere and no tud_mount_cb in the
+// tree, so a session with zero "Console packet" lines and a session where the
+// console simply stopped talking looked byte-for-byte identical in the log.
+// That ambiguity cost a 15-minute live session: the board ran fine, printed a
+// heartbeat every 2s, and we could not tell "Xbox not plugged in" from "Xbox
+// plugged in but ignoring us".
+//
+// tud_mount_cb()/tud_umount_cb() below log the host-driven events, and the
+// heartbeat reports tud_mounted()/tud_connected() plus how long it has been
+// since the last packet. Together that separates all three cases: never
+// attached / attached but silent / attached and talking.
+static uint32_t console_rx_count = 0;
+static uint32_t console_last_rx_ms = 0;
+
 // How many input reports we have actually put on the wire to the console. The
 // pad-side counter lives in the host driver, so with these two numbers a silent
 // pad, a pad we fail to parse, and a pad we fail to forward stop looking alike.
@@ -306,6 +323,13 @@ static bool xbone_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result,
         }
 
         uint8_t cmd = xgip_get_command(&incoming_xgip);
+
+        // Counting for the heartbeat. Without it, "there is no Console packet
+        // line here" cannot be told apart from "there were hundreds a minute
+        // ago and then it went quiet".
+        console_rx_count++;
+        console_last_rx_ms = platform_time_ms();
+
         printf("[tud_xbone] Console packet: cmd=0x%02x len=%u", cmd, (unsigned)xferred_bytes);
         if (cmd == GIP_ACK_RESPONSE) {
             // Ground truth: the console is a Microsoft GIP implementation, so
@@ -535,6 +559,26 @@ void tud_xbone_request_reenumeration(void)
     reenum_start_ms = platform_time_ms();
 }
 
+// TinyUSB declares these as weak symbols in device/usbd.c, so defining them
+// here is how we get notified. Nothing else in this tree defines them
+// (checked before adding - a second strong definition would be a link error).
+//
+// tud_mount_cb fires once the console has sent SET_CONFIGURATION, i.e. it
+// really did enumerate us. tud_umount_cb fires on bus reset / detach. That
+// pair answers "is anything attached to our device port at all", which the
+// absence of a VBUS sense line made unanswerable before.
+void tud_mount_cb(void)
+{
+    printf("[tud_xbone] CONSOLE MOUNTED t=%lu (host finished enumerating us)\n",
+           (unsigned long)platform_time_ms());
+}
+
+void tud_umount_cb(void)
+{
+    printf("[tud_xbone] CONSOLE UNMOUNTED t=%lu\n",
+           (unsigned long)platform_time_ms());
+}
+
 void tud_xbone_update(void)
 {
     uint32_t now = platform_time_ms();
@@ -552,10 +596,15 @@ void tud_xbone_update(void)
         static uint32_t last_status_ms = 0;
         if ((now - last_status_ms) >= 2000) {
             last_status_ms = now;
-            printf("[tud_xbone] STATUS t=%lu state=%d powered=%d auth=%d input_sent=%lu\n",
+            printf("[tud_xbone] STATUS t=%lu state=%d powered=%d auth=%d input_sent=%lu"
+                   " mounted=%d connected=%d cons_rx=%lu cons_idle=%lu\n",
                    (unsigned long)now, driver_state, xbox_powered_on ? 1 : 0,
                    auth_data.auth_completed ? 1 : 0,
-                   (unsigned long)input_reports_sent_to_console);
+                   (unsigned long)input_reports_sent_to_console,
+                   tud_mounted() ? 1 : 0,
+                   tud_connected() ? 1 : 0,
+                   (unsigned long)console_rx_count,
+                   (unsigned long)(console_rx_count ? (now - console_last_rx_ms) : now));
         }
     }
 
